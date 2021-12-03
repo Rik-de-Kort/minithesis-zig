@@ -55,7 +55,7 @@ test "TestCase history" {
     try std.testing.expectEqual(buf, expected);
 }
 
-const InterestTest = fn (tc: *TestCase) MTError!bool;
+const InterestTest = fn (alloc: *Allocator, tc: *TestCase) MTError!bool;
 const MAX_RUNS = 1000;
 
 /// Helper to create a test case with history given by to_check and apply the InterestTest on it.
@@ -64,10 +64,11 @@ fn interesting_for_slice(alloc: *Allocator, to_check: []u8, itest: InterestTest)
     list.appendSlice(to_check) catch return false;
     var tc: TestCase = TestCase.for_history(list);
     defer tc.deinit();
-    return itest(&tc) catch false;
+    return itest(alloc, &tc) catch false;
 }
 
-fn interesting_if_ge_10(tc: *TestCase) MTError!bool {
+fn interesting_if_ge_10(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    _ = alloc;
     var buf: [1]u8 = undefined;
     try tc.get_bytes(&buf);
     // std.debug.print("buf {any}", .{buf});
@@ -104,21 +105,39 @@ fn shrink_reduce(alloc: *Allocator, attempt: []u8, interesting: InterestTest) an
     return known_good;
 }
 
-pub fn shrink(history: []u8, interesting: InterestTest) []u8 {
-    _ = interesting;
-    return history;
+fn shrink_remove(alloc: *Allocator, attempt: []u8, interesting: InterestTest) anyerror![]u8 {
+    if (attempt.len == 0) return attempt;
+    var known_good = try std.mem.dupe(alloc, u8, attempt);
+    var k: usize = 1; // Delete k items at a time
+    while (interesting_for_slice(alloc, attempt, interesting)) {
+        std.mem.copy(u8, attempt, known_good);
+        var i: usize = attempt.len - k;
+        while (i > 0) : (i -= 1) {
+            _ = i;
+            // Todo(Rik): implement this stuff!
+        }
+        break;
+    }
+    return known_good;
+}
+
+pub fn shrink(alloc: *Allocator, attempt: []u8, interesting: InterestTest) ![]u8 {
+    const reduced = shrink_reduce(alloc, attempt, interesting) catch attempt;
+    defer alloc.free(reduced);
+    const removed = shrink_remove(alloc, reduced, interesting) catch reduced;
+    return removed;
 }
 
 pub fn run_test(alloc: *Allocator, interesting: InterestTest) anyerror!?[]u8 {
     var tc = TestCase.init(alloc);
     defer tc.deinit();
 
-    var is_interesting: bool = interesting(&tc) catch false;
+    var is_interesting: bool = interesting(alloc, &tc) catch false;
     var n_runs: usize = 1;
     while (!is_interesting and n_runs < MAX_RUNS) : (n_runs += 1) {
         tc.deinit();
         tc = TestCase.init(alloc);
-        is_interesting = interesting(&tc) catch false;
+        is_interesting = interesting(alloc, &tc) catch false;
     }
     if (is_interesting) {
         const shrunk: []u8 = try shrink_reduce(alloc, tc.history.items, interesting);
@@ -133,6 +152,26 @@ pub fn interesting_if_gt_10(x: []u8) bool {
     return x[0] > 10;
 }
 
+pub fn simple_list_of_bools(alloc: *Allocator, tc: *TestCase) MTError!ArrayList(bool) {
+    var result = ArrayList(bool).init(alloc);
+    var buf: [1]u8 = undefined;
+    try tc.get_bytes(&buf);
+    while (buf[0] > 128) {
+        try tc.get_bytes(&buf);
+        result.append(buf[0] > 128) catch return MTError.Overrun;
+        try tc.get_bytes(&buf);
+    }
+    return result;
+}
+
+test "simple_list_of_bools_works" {
+    var alloc = std.testing.allocator;
+    var tc = TestCase.init(alloc);
+    defer tc.deinit();
+    const result = simple_list_of_bools(alloc, &tc) catch return error.TestExpectedEqual;
+    defer result.deinit();
+}
+
 pub fn main() anyerror!void {
     var i: usize = 0;
     while (i < 10) : (i += 1) {
@@ -144,7 +183,8 @@ pub fn main() anyerror!void {
     }
 }
 
-fn always_interesting(tc: *TestCase) MTError!bool {
+fn always_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    _ = alloc;
     _ = tc;
     return true;
 }
@@ -153,7 +193,8 @@ test "Always interesting" {
     try std.testing.expect(null != try run_test(std.testing.allocator, always_interesting));
 }
 
-fn never_interesting(tc: *TestCase) MTError!bool {
+fn never_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    _ = alloc;
     _ = tc;
     return false;
 }
@@ -162,7 +203,8 @@ test "Never interesting" {
     try std.testing.expect(null == try run_test(std.testing.allocator, never_interesting));
 }
 
-fn rarely_interesting(tc: *TestCase) MTError!bool {
+fn rarely_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    _ = alloc;
     var buf: [1]u8 = undefined;
     try tc.get_bytes(&buf);
     return buf[0] < 10;
@@ -182,7 +224,8 @@ test "Reduce shrinking" {
     try std.testing.expectEqualSlices(u8, expected[0..expected.len], result);
 }
 
-fn interesting_if_both_ge_10(tc: *TestCase) MTError!bool {
+fn interesting_if_both_ge_10(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    _ = alloc;
     var buf: [2]u8 = undefined;
     try tc.get_bytes(&buf);
     return buf[0] >= 10 and buf[1] >= 10;
@@ -193,4 +236,18 @@ test "Reduce shrinking in other position" {
     const result = (try run_test(std.testing.allocator, interesting_if_both_ge_10)) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualSlices(u8, expected[0..expected.len], result);
+}
+
+fn first_is_true(alloc: *Allocator, tc: *TestCase) MTError!bool {
+    const result = try simple_list_of_bools(alloc, tc);
+    defer result.deinit();
+    return result.items.len > 0 and result.items[0];
+}
+
+test "Shrink ArrayList of bools" {
+    const expected: [3]u8 = .{ 129, 129, 0 };
+    var attempt: [5]u8 = .{ 200, 175, 200, 23, 99 };
+    const result = try shrink(std.testing.allocator, attempt[0..], first_is_true);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, expected[0..], result);
 }
