@@ -26,6 +26,19 @@ test "cloneArrayList" {
     try std.testing.expect(first.items[0] != second.items[0]);
 }
 
+test "cloneArrayList with replaceRange" {
+    var first = ArrayList(u8).init(std.testing.allocator);
+    defer first.deinit();
+    var data: [3]u8 = .{ 1, 2, 3 };
+    try first.appendSlice(&data);
+    var second = try cloneArrayList(first);
+    defer second.deinit();
+    try std.testing.expectEqualSlices(u8, first.items, second.items);
+    try first.replaceRange(0, 2, &.{});
+    std.testing.expectEqualSlices(u8, first.items, second.items) catch return;
+    return error.TestUnexpectedError;
+}
+
 fn dupeArrayList(dest: *ArrayList(u8), source: ArrayList(u8)) !void {
     try dest.ensureTotalCapacity(source.items.len);
     dest.items.len = source.items.len;
@@ -109,9 +122,10 @@ const TestCase = struct {
     rng: std.rand.Isaac64,
     history: ArrayList(u8),
     index: usize,
+    locked: bool,
 
     pub fn init(alloc: *Allocator) Self {
-        return Self{ .rng = std.rand.Isaac64.init(@intCast(u64, std.time.milliTimestamp())), .history = ArrayList(u8).init(alloc), .index = 0 };
+        return Self{ .rng = std.rand.Isaac64.init(@intCast(u64, std.time.milliTimestamp())), .history = ArrayList(u8).init(alloc), .index = 0, .locked = false };
     }
 
     pub fn deinit(self: *Self) void {
@@ -119,7 +133,7 @@ const TestCase = struct {
     }
 
     pub fn for_history(history: ArrayList(u8)) Self {
-        return Self{ .rng = std.rand.Isaac64.init(@intCast(u64, std.time.milliTimestamp())), .history = history, .index = 0 };
+        return Self{ .rng = std.rand.Isaac64.init(@intCast(u64, std.time.milliTimestamp())), .history = history, .index = 0, .locked = true };
     }
 
     pub fn get_bytes(self: *Self, buf: []u8) MTError!void {
@@ -128,6 +142,7 @@ const TestCase = struct {
             buf[i] = self.history.items[self.index + i];
         }
         if (i < buf.len) {
+            if (self.locked) return MTError.Overrun;
             self.rng.fill(buf[i..buf.len]);
             self.history.appendSlice(buf[i..buf.len]) catch return MTError.Overrun;
         }
@@ -202,37 +217,56 @@ fn shrink_remove(alloc: *Allocator, old_attempt: ArrayList(u8), interesting: Int
     _ = alloc;
     if (old_attempt.items.len == 0) return old_attempt;
     var attempt = try cloneArrayList(old_attempt);
-    defer attempt.deinit();
     var known_good = try cloneArrayList(attempt);
 
     var k: usize = 2; // Delete k items at a time
     while (k >= 1) : (k -= 1) {
-        known_good.deinit();
-        known_good = try cloneArrayList(attempt);
+        attempt.deinit();
+        attempt = try cloneArrayList(known_good);
         var start: usize = known_good.items.len - k;
         while (start >= 0) : (start -= 1) {
+            attempt.deinit();
+            attempt = try cloneArrayList(known_good);
+            // std.debug.print("k={}, start={}, known_good={any}, attempt={any}\n", .{ k, start, known_good.items, attempt.items });
             if (start + k > attempt.items.len) {
                 if (start > 0) continue;
                 break;
             }
+            // std.debug.print("replacing ranges, attempt={any}, known_good={any}\n", .{ attempt.items, known_good.items });
             try attempt.replaceRange(start, k, &.{});
+            // std.debug.print("replaced, attempt={any}, known_good={any}\n", .{ attempt.items, known_good.items });
             if (interesting(alloc, &TestCase.for_history(attempt)) catch false) {
                 // Todo(Rik): ask in zig-help if this is the right pattern
+                // std.debug.print("it was interesting!\n", .{});
                 known_good.deinit();
                 known_good = try cloneArrayList(attempt);
 
                 start = std.math.sub(usize, known_good.items.len, k) catch 1;
+                // } else {
+                //     std.debug.print("It was not interesting! known_good={any}\n", .{known_good.items});
             }
+
             if (start == 0) break;
         }
     }
+    attempt.deinit();
     return known_good;
 }
 
-test "shrink_remove ez" {
+test "shrink_remove everything" {
     var alloc = std.testing.allocator;
     var attempt_array: [5]u8 = .{ 1, 2, 3, 4, 5 };
     var attempt = ArrayList(u8).fromOwnedSlice(alloc, attempt_array[0..]);
+    const expected: [0]u8 = .{};
+    const result = try shrink_remove(std.testing.allocator, attempt, always_interesting);
+    defer result.deinit();
+    try std.testing.expectEqualSlices(u8, expected[0..], result.items);
+}
+
+test "shrink_remove one_left" {
+    var alloc = std.testing.allocator;
+    var attempt_array: [5]u8 = .{ 1, 2, 3, 4, 5 };
+    var attempt = ArrayList(u8).fromOwnedSlice(alloc, attempt_array[0..]); // Todo(Rik): iffy pattern, slice should be allocated by alloc
     const expected: [0]u8 = .{};
     const result = try shrink_remove(std.testing.allocator, attempt, always_interesting);
     defer result.deinit();
@@ -243,6 +277,7 @@ pub fn shrink(alloc: *Allocator, attempt: ArrayList(u8), interesting: InterestTe
     const reduced = shrink_reduce(alloc, attempt, interesting) catch attempt;
     defer reduced.deinit();
     const removed = shrink_remove(alloc, reduced, interesting) catch reduced;
+    // std.debug.print("reduced={any}, removed={any}\n", .{ reduced.items, removed.items });
     return removed;
 }
 
@@ -258,8 +293,9 @@ pub fn run_test(alloc: *Allocator, interesting: InterestTest) anyerror!?ArrayLis
         is_interesting = interesting(alloc, &tc) catch false;
     }
     if (is_interesting) {
+        // std.debug.print("Trying to shrink choices {any}.\n", .{tc.history.items});
         const shrunk: ArrayList(u8) = try shrink_reduce(alloc, tc.history, interesting);
-        std.debug.print("Got an interesting test case with choices {any}.\n", .{shrunk.items});
+        // std.debug.print("Got an interesting test case with choices {any}.\n", .{shrunk.items});
         return shrunk;
     } else {
         return null;
@@ -316,6 +352,7 @@ fn first_is_true(alloc: *Allocator, tc: *TestCase) MTError!bool {
 
 pub fn simple_list_of_bools(alloc: *Allocator, tc: *TestCase) MTError!ArrayList(bool) {
     var result = ArrayList(bool).init(alloc);
+    errdefer result.deinit();
     var buf: [1]u8 = undefined;
     try tc.get_bytes(&buf);
     while (buf[0] > 128) {
