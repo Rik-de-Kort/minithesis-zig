@@ -64,6 +64,10 @@ pub fn numbers(comptime T: type, tc: *TestCase) !T {
     return @bitCast(T, buf);
 }
 
+pub fn u8s(tc: *TestCase) !u8 {
+    return try numbers(u8, tc);
+}
+
 test "smoke numbers" {
     var tc = TestCase.init(std.testing.allocator);
     defer tc.deinit();
@@ -76,4 +80,37 @@ test "smoke numbers" {
     _ = k;
     const m: f64 = try numbers(f64, &tc);
     _ = m;
+}
+
+pub fn arraylists(comptime T: type, alloc: *Allocator, tc: *TestCase, elements: fn (tc: *TestCase) anyerror!T, min_size: usize, max_size: usize) !ArrayList(T) {
+    var result = ArrayList(T).init(alloc);
+    while (result.items.len <= max_size and (result.items.len < min_size or try weighted_bools(tc, 0.1))) {
+        try result.append(try elements(tc));
+    }
+    return result;
+}
+
+test "smoke arraylists" {
+    var tc = TestCase.init(std.testing.allocator);
+    defer tc.deinit();
+
+    const arraylist = try arraylists(u8, std.testing.allocator, &tc, u8s, 3, 10);
+    defer arraylist.deinit();
+    try std.testing.expect(arraylist.items.len >= 3);
+    try std.testing.expect(arraylist.items.len <= 10);
+}
+
+pub fn slices(comptime T: type, alloc: *Allocator, tc: *TestCase, elements: fn (tc: *TestCase) anyerror!T, min_size: usize, max_size: usize) ![]T {
+    var result = try arraylists(T, alloc, tc, elements, min_size, max_size);
+    return result.toOwnedSlice();
+}
+
+test "smoke slices" {
+    var tc = TestCase.init(std.testing.allocator);
+    defer tc.deinit();
+
+    const slice = try slices(u8, std.testing.allocator, &tc, u8s, 3, 10);
+    defer std.testing.allocator.free(slice);
+    try std.testing.expect(slice.len >= 3);
+    try std.testing.expect(slice.len <= 10);
 }
