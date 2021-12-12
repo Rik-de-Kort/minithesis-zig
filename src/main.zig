@@ -4,8 +4,7 @@ const ArrayList = std.ArrayList;
 
 pub fn main() anyerror!void {
     // Main funciton is not really used for anything. We test stuff!
-    const r: usize = std.math.sub(usize, 64, 128) catch 1;
-    _ = r;
+    std.debug.print("{any}\n", .{@typeInfo(u32)});
 }
 
 fn cloneArrayList(arr: ArrayList(u8)) !ArrayList(u8) {
@@ -117,7 +116,7 @@ test "cloneArrayLists property test" {
 
 const MTError = error{ Overrun, Interesting };
 
-const TestCase = struct {
+pub const TestCase = struct {
     const Self = @This();
     rng: std.rand.Isaac64,
     history: ArrayList(u8),
@@ -170,131 +169,215 @@ test "TestCase history" {
     try std.testing.expectEqual(buf, expected);
 }
 
-const InterestTest = fn (alloc: *Allocator, tc: *TestCase) MTError!bool;
+const InterestTest = fn (tc: *TestCase) MTError!bool;
 const MAX_RUNS = 10000;
 
 ///////////////////////////////////////
 //       Shrinking and test runner  ///
 ///////////////////////////////////////
 
-fn shrink_reduce(alloc: *Allocator, old_attempt: ArrayList(u8), interesting: InterestTest) anyerror!ArrayList(u8) {
-    if (old_attempt.items.len == 0) return old_attempt;
-    // std.debug.print("shrinking attempt {any}\n", .{old_attempt.items});
-    var attempt = try cloneArrayList(old_attempt);
+const asc_u8 = std.sort.asc(u8);
+
+// Try sorting every possible contiguous slice of the array.
+fn shrink_sort(known_good: *ArrayList(u8), attempt: *ArrayList(u8), interesting: InterestTest) anyerror!bool {
+    if (known_good.items.len == 0) return false;
+    var is_improved = false;
+    var k: usize = known_good.items.len; // Number of items to sort
+    while (k > 0) : (k -= 1) {
+        // std.debug.print("{}\n", .{k});
+        if (k > known_good.items.len) continue;
+
+        var i: usize = known_good.items.len - k; // Start of sorting
+        while (i >= 0) : (i -= 1) {
+            try dupeArrayList(attempt, known_good.*);
+            if (std.sort.isSorted(u8, attempt.items[i .. i + k], {}, asc_u8) and i > 0) continue;
+            if (std.sort.isSorted(u8, attempt.items[i .. i + k], {}, asc_u8) and i == 0) break;
+
+            std.sort.sort(u8, attempt.items[i .. i + k], {}, asc_u8);
+            if (interesting(&TestCase.for_history(attempt.*)) catch false) {
+                // std.debug.print("success! copying attempt={any} into known_good={any}\n", .{ attempt.items, known_good.items });
+                is_improved = true;
+                try dupeArrayList(known_good, attempt.*);
+            }
+            if (i == 0) break;
+        }
+    }
+    return is_improved;
+}
+
+test "shrink_sort trivial" {
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    try known_good.appendSlice(&.{ 3, 2, 1 });
+    defer known_good.deinit();
+
+    var attempt = ArrayList(u8).init(std.testing.allocator);
     defer attempt.deinit();
 
-    var known_good = try cloneArrayList(attempt);
-    var i: usize = attempt.items.len - 1;
+    const is_improved = try shrink_sort(&known_good, &attempt, always_interesting);
+    try std.testing.expect(is_improved);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, known_good.items);
+}
+
+test "shrink_sort partial" {
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    try known_good.appendSlice(&.{ 30, 20, 10, 17 });
+    defer known_good.deinit();
+
+    var attempt = ArrayList(u8).init(std.testing.allocator);
+    defer attempt.deinit();
+
+    const is_improved = try shrink_sort(&known_good, &attempt, interesting_if_0_gt_1);
+    try std.testing.expect(is_improved);
+    try std.testing.expectEqualSlices(u8, &.{ 30, 10, 17, 20 }, known_good.items);
+}
+
+test "shrink_sort when doesn't improve" {
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    try known_good.appendSlice(&.{ 30, 20, 10 });
+    defer known_good.deinit();
+
+    var attempt = ArrayList(u8).init(std.testing.allocator);
+    defer attempt.deinit();
+
+    const is_improved = try shrink_sort(&known_good, &attempt, interesting_if_desc);
+    try std.testing.expectEqualSlices(u8, &.{ 30, 20, 10 }, known_good.items);
+    try std.testing.expect(!is_improved);
+}
+
+// Try reducing elements towards 0, one at a time.
+fn shrink_reduce(known_good: *ArrayList(u8), attempt: *ArrayList(u8), interesting: InterestTest) anyerror!bool {
+    if (known_good.items.len == 0) return false;
+
+    var is_improved = false;
+    var i: usize = known_good.items.len - 1;
     while (i >= 0) : (i -= 1) {
-        attempt.deinit();
-        attempt = try cloneArrayList(known_good);
+        try dupeArrayList(attempt, known_good.*);
+        if (attempt.items[i] == 0 and i > 0) continue;
+        if (attempt.items[i] == 0 and i == 0) break;
 
-        // std.debug.print("Reducing {} for {any}\n", .{ i, attempt.items });
-        // std.debug.print("Known good is {any}\n", .{known_good.items});
-        while (try interesting(alloc, &TestCase.for_history(attempt))) {
-            known_good.deinit();
-            known_good = try cloneArrayList(attempt);
-
+        attempt.items[i] -= 1;
+        while (interesting(&TestCase.for_history(attempt.*)) catch false) : (attempt.items[i] -= 1) {
+            is_improved = true;
+            try dupeArrayList(known_good, attempt.*);
             if (attempt.items[i] == 0) break;
-            attempt.items[i] -= 1;
         }
-        // std.debug.print("after a reduction, known good is {any}\n", .{known_good.items});
         if (i == 0) break;
     }
-    return known_good;
+    return is_improved;
 }
 
 test "Reduce shrinking in both positions" {
-    const expected: [2]u8 = .{ 10, 10 };
-    var attempt: [2]u8 = .{ 100, 100 };
-    var alloc = std.testing.allocator;
-    const result = try shrink_reduce(alloc, ArrayList(u8).fromOwnedSlice(alloc, attempt[0..]), interesting_if_both_ge_10);
-    defer result.deinit();
-    try std.testing.expectEqualSlices(u8, expected[0..], result.items[0..]);
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    try known_good.appendSlice(&.{ 100, 100 });
+    defer known_good.deinit();
+
+    var attempt = ArrayList(u8).init(std.testing.allocator);
+    defer attempt.deinit();
+
+    const is_improved = try shrink_reduce(&known_good, &attempt, interesting_if_both_ge_10);
+    try std.testing.expect(is_improved);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10 }, known_good.items);
 }
 
-fn shrink_remove(alloc: *Allocator, old_attempt: ArrayList(u8), interesting: InterestTest) anyerror!ArrayList(u8) {
-    _ = alloc;
-    if (old_attempt.items.len == 0) return old_attempt;
-    var attempt = try cloneArrayList(old_attempt);
-    var known_good = try cloneArrayList(attempt);
+// Try removing elements, several at a time.
+fn shrink_remove(known_good: *ArrayList(u8), attempt: *ArrayList(u8), interesting: InterestTest) anyerror!bool {
+    if (known_good.items.len == 0) return false;
 
-    var k: usize = 2; // Delete k items at a time
+    var improved = false;
+    var k: usize = known_good.items.len; // Delete k items at a time
     while (k >= 1) : (k -= 1) {
-        attempt.deinit();
-        attempt = try cloneArrayList(known_good);
+        if (known_good.items.len < k) continue;
         var start: usize = known_good.items.len - k;
         while (start >= 0) : (start -= 1) {
-            attempt.deinit();
-            attempt = try cloneArrayList(known_good);
-            // std.debug.print("k={}, start={}, known_good={any}, attempt={any}\n", .{ k, start, known_good.items, attempt.items });
-            if (start + k > attempt.items.len) {
-                if (start > 0) continue;
-                break;
-            }
-            // std.debug.print("replacing ranges, attempt={any}, known_good={any}\n", .{ attempt.items, known_good.items });
-            try attempt.replaceRange(start, k, &.{});
-            // std.debug.print("replaced, attempt={any}, known_good={any}\n", .{ attempt.items, known_good.items });
-            if (interesting(alloc, &TestCase.for_history(attempt)) catch false) {
-                // Todo(Rik): ask in zig-help if this is the right pattern
-                // std.debug.print("it was interesting!\n", .{});
-                known_good.deinit();
-                known_good = try cloneArrayList(attempt);
+            if (start + k > known_good.items.len and start > 0) continue;
+            if (start + k > known_good.items.len and start == 0) break;
 
-                start = std.math.sub(usize, known_good.items.len, k) catch 1;
-                // } else {
-                //     std.debug.print("It was not interesting! known_good={any}\n", .{known_good.items});
+            try dupeArrayList(attempt, known_good.*);
+            try attempt.replaceRange(start, k, &.{});
+            if (interesting(&TestCase.for_history(attempt.*)) catch false) {
+                try dupeArrayList(known_good, attempt.*);
+                improved = true;
             }
 
             if (start == 0) break;
         }
     }
-    attempt.deinit();
-    return known_good;
+    return improved;
 }
 
 test "shrink_remove everything" {
-    var alloc = std.testing.allocator;
-    var attempt_array: [5]u8 = .{ 1, 2, 3, 4, 5 };
-    var attempt = ArrayList(u8).fromOwnedSlice(alloc, attempt_array[0..]);
-    const expected: [0]u8 = .{};
-    const result = try shrink_remove(std.testing.allocator, attempt, always_interesting);
-    defer result.deinit();
-    try std.testing.expectEqualSlices(u8, expected[0..], result.items);
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    defer known_good.deinit();
+    try known_good.appendSlice(&.{ 1, 2, 3, 4, 5 });
+
+    var attempt = ArrayList(u8).init(std.testing.allocator);
+    defer attempt.deinit();
+
+    const is_improved = try shrink_remove(&known_good, &attempt, always_interesting);
+
+    try std.testing.expect(is_improved);
+    try std.testing.expectEqualSlices(u8, &.{}, known_good.items);
 }
 
-test "shrink_remove one_left" {
-    var alloc = std.testing.allocator;
-    var attempt_array: [5]u8 = .{ 1, 2, 3, 4, 5 };
-    var attempt = ArrayList(u8).fromOwnedSlice(alloc, attempt_array[0..]); // Todo(Rik): iffy pattern, slice should be allocated by alloc
-    const expected: [0]u8 = .{};
-    const result = try shrink_remove(std.testing.allocator, attempt, always_interesting);
-    defer result.deinit();
-    try std.testing.expectEqualSlices(u8, expected[0..], result.items);
+/// "Shrinking" means modifying some bytes in the test case so that the test case becomes "smaller",
+/// that is, either shorter or having items closer to 0. Generically, a shrinking pass looks like:
+///
+/// while something is true:
+///   copy known_good into attempt
+///   modify attempt
+///   if interesting(attempt)
+///     copy attempt into known_good
+///     mark pass as successful
+/// return true if pass was successful
+///
+/// We run these shrinking passes after eachother until there is no improvement.
+pub fn shrink(alloc: *Allocator, to_shrink: ArrayList(u8), interesting: InterestTest) !ArrayList(u8) {
+    var known_good = ArrayList(u8).init(alloc);
+    try dupeArrayList(&known_good, to_shrink);
+    var attempt = ArrayList(u8).init(alloc);
+    defer attempt.deinit();
+
+    var improved: bool = true;
+    while (improved) {
+        improved = false;
+        improved = improved or (shrink_remove(&known_good, &attempt, interesting) catch false);
+        improved = improved or (shrink_reduce(&known_good, &attempt, interesting) catch false);
+        improved = improved or (shrink_sort(&known_good, &attempt, interesting) catch false);
+    }
+    return known_good;
 }
 
-pub fn shrink(alloc: *Allocator, attempt: ArrayList(u8), interesting: InterestTest) !ArrayList(u8) {
-    const reduced = shrink_reduce(alloc, attempt, interesting) catch attempt;
-    defer reduced.deinit();
-    const removed = shrink_remove(alloc, reduced, interesting) catch reduced;
-    // std.debug.print("reduced={any}, removed={any}\n", .{ reduced.items, removed.items });
-    return removed;
+test "shrink_remove_curious" {
+    var known_good = ArrayList(u8).init(std.testing.allocator);
+    defer known_good.deinit();
+    try known_good.appendSlice(&.{ 129, 129, 0, 0, 0 });
+    var attempt = ArrayList(u8).init(std.testing.allocator);
+    defer attempt.deinit();
+    const is_improved = try shrink_remove(&known_good, &attempt, first_is_true);
+
+    const expected: [3]u8 = .{ 129, 129, 0 };
+
+    try std.testing.expect(is_improved);
+    try std.testing.expectEqualSlices(u8, expected[0..], known_good.items);
 }
 
+/// Run a test for `interesting`. Tries to find a TestCase tc such that `interesting(&tc)` is true.
+/// It does this by randomly generating TestCases, which then get shrunk to produce a (hopefully)
+/// minimal example.
 pub fn run_test(alloc: *Allocator, interesting: InterestTest) anyerror!?ArrayList(u8) {
     var tc = TestCase.init(alloc);
     defer tc.deinit();
 
-    var is_interesting: bool = interesting(alloc, &tc) catch false;
+    var is_interesting: bool = interesting(&tc) catch false;
     var n_runs: usize = 1;
     while (!is_interesting and n_runs < MAX_RUNS) : (n_runs += 1) {
         tc.deinit();
         tc = TestCase.init(alloc);
-        is_interesting = interesting(alloc, &tc) catch false;
+        is_interesting = interesting(&tc) catch false;
     }
     if (is_interesting) {
         // std.debug.print("Trying to shrink choices {any}.\n", .{tc.history.items});
-        const shrunk: ArrayList(u8) = try shrink_reduce(alloc, tc.history, interesting);
+        const shrunk: ArrayList(u8) = try shrink(alloc, tc.history, interesting);
         // std.debug.print("Got an interesting test case with choices {any}.\n", .{shrunk.items});
         return shrunk;
     } else {
@@ -302,49 +385,56 @@ pub fn run_test(alloc: *Allocator, interesting: InterestTest) anyerror!?ArrayLis
     }
 }
 
-////////////////////////////////////////
-/// Interestingness functions        ///
-////////////////////////////////////////
+/////////////////////////////////////
+/// Integration tests             ///
+/////////////////////////////////////
+fn interesting_if_desc(tc: *TestCase) !bool {
+    var buf: [3]u8 = undefined;
+    try tc.get_bytes(&buf);
+    return buf[0] > buf[1] and buf[1] > buf[2];
+}
 
-fn interesting_if_ge_10(alloc: *Allocator, tc: *TestCase) MTError!bool {
-    _ = alloc;
+fn interesting_if_0_gt_1(tc: *TestCase) !bool {
+    var buf: [4]u8 = undefined;
+    try tc.get_bytes(&buf);
+    return buf[0] > buf[1];
+}
+
+fn interesting_if_ge_10(tc: *TestCase) MTError!bool {
     var buf: [1]u8 = undefined;
     try tc.get_bytes(&buf);
     // std.debug.print("buf {any}", .{buf});
     return buf[0] >= 10;
 }
 
-pub fn interesting_if_gt_10(x: ArrayList(u8)) bool {
+fn interesting_if_gt_10(x: ArrayList(u8)) bool {
     return x[0] > 10;
 }
 
-fn interesting_if_both_ge_10(alloc: *Allocator, tc: *TestCase) MTError!bool {
-    _ = alloc;
+fn interesting_if_both_ge_10(tc: *TestCase) MTError!bool {
     var buf: [2]u8 = undefined;
     try tc.get_bytes(&buf);
     return buf[0] >= 10 and buf[1] >= 10;
 }
 
-fn always_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
-    _ = alloc;
+fn always_interesting(tc: *TestCase) MTError!bool {
     _ = tc;
     return true;
 }
 
-fn never_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
-    _ = alloc;
+fn never_interesting(tc: *TestCase) MTError!bool {
     _ = tc;
     return false;
 }
 
-fn rarely_interesting(alloc: *Allocator, tc: *TestCase) MTError!bool {
-    _ = alloc;
+fn rarely_interesting(tc: *TestCase) MTError!bool {
     var buf: [1]u8 = undefined;
     try tc.get_bytes(&buf);
     return buf[0] < 10;
 }
 
-fn first_is_true(alloc: *Allocator, tc: *TestCase) MTError!bool {
+fn first_is_true(tc: *TestCase) MTError!bool {
+    var alloc = std.testing.allocator;
     const result = try simple_list_of_bools(alloc, tc);
     defer result.deinit();
     return result.items.len > 0 and result.items[0];
